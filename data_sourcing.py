@@ -36,7 +36,7 @@ def get_price_data(tickers, start_date, end_date, auto_adjust=True):
         # Format the DataFrame for better processing later
         if len(tickers) > 1:
             # Stack multi-level columns ('Adj Close', 'Close', etc.) into rows
-            data = data.stack()
+            data = data.stack(future_stack=True)
             # Rename columns to be lowercase and easier to use
             data.index.names = ['date', 'ticker']
         else:
