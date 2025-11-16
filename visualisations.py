@@ -11,7 +11,7 @@ sns.set_theme(style="darkgrid")
 
 # --- 1. EDA PLOTS ---
 
-def plot_price_history(df, price_col='adj_close', title='Price History'):
+def plot_price_history(df, price_col='close', title='Price History'):
     """
     Plots the price history for one or more tickers.
     
