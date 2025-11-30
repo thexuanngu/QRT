@@ -1,14 +1,15 @@
 # (Trimmed snippet — use the full code run above for direct copy)
 
-from typing import Callable, Optional, List, Dict, Any, Union, Sequence
+from typing import Callable, Optional, List, Dict, Any, Union, Tuple, Sequence
 
-from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
+
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm 
+import inspect
 
 
 @dataclass
@@ -24,6 +25,7 @@ class StrategyError(Exception):
 
 class NotImplementedError(Exception):
     pass
+
 
 class Strategy(ABC):
     """
@@ -130,13 +132,18 @@ class FunctionStrategy(Strategy):
     def __init__(self,
                  name: str,
                  user_fn: Callable, # MUST be a class event 
+                 required_params: Tuple[str] = None,
+                 optional_params: Tuple[str] = None,
+                 tradable_assets: Tuple[str] = None, 
                  mode: str = "event",
                  params: Optional[Dict[str, Any]] = None):
         """
         Parameters
         ----------
         user_fn : callable
-            The user-supplied function.
+            The user-supplied function. 
+            Must return two arguments:
+            the target portfolio and the amount of cash it wants to hold.
         mode : {'event', 'vector'}
             'event' calls the function once per tick with (index, history_up_to_index, state).
             'vector' calls the function once with the full history and expects vector output.
@@ -147,13 +154,19 @@ class FunctionStrategy(Strategy):
         #meta = meta or StrategyMeta(name=getattr(user_fn, "__name__", "function_strategy"),
         #                            params=params or {})
         # Force the strategy to be a function. 
-        assert (isinstance(user_fn, Strategy)), "Please only use a Strategy class as the function"
+    
 
         super().__init__(name=name)
         self.user_fn = user_fn
-        self.mode = mode
+        self.required_params = required_params
+        self.optional_params = optional_params
+        self.tradable_assets = tradable_assets
+
+        self.mode = mode 
+
         # keep a cache for vector mode to avoid recomputing on every tick
         self._vector_cache: Optional[pd.Series] = None
+
 
     def initialize(self) -> None:
         super().initialize()
@@ -161,17 +174,23 @@ class FunctionStrategy(Strategy):
         self._state = {}
         self._vector_cache = None
 
-    def predict(self, history: pd.DataFrame) -> Union[float, pd.Series, Dict[str, float]]:
+
+    # Update - predict now includes an argument called tradable_assets. 
+    # NB : will remove the history argument once I figure out how to generalise
+    def predict(self, tradable_assets, history, position_history):
         """
         Return the target portfolio for the *current* tick. Backtester should call this
         once per tick passing history up to and including the current tick.
 
         In 'vector' mode, we lazily compute the whole series on first call and then
         return the value for the current index.
+
+        tradable_assets: an iterable (either list, or array) of tradable assets. This is so that the algorithm only spits out portfolio consisting of assets that we ACTUALLY want to trade.
         """
 
         if not isinstance(history, pd.DataFrame):
             raise StrategyError("history must be a pandas DataFrame")
+        
 
         if history.empty:
             # no data yet -> neutral
@@ -179,13 +198,18 @@ class FunctionStrategy(Strategy):
 
         current_index = history.index[-1]
 
-        if self.mode == "event":
+        target_cash = None
+        target_portfolio = None
+        if self.mode == "event": # event mode 
             # user_fn(index, history_up_to_index, state) -> target
+
             try:
-                target_portfolio = self.user_fn(current_index, history.copy(), self._state)
+                target_cash, target_portfolio = self.user_fn(tradable_assets, history.copy(), position_history.copy(), self._state)
             except TypeError:
                 # some users may ignore index and state; try fallback
-                target_portfolio = self.user_fn(history.copy())
+                target_cash, target_portfolio = self.user_fn(tradable_assets, history.copy(), position_history.copy())
+            except AttributeError:
+                target_cash, target_portfolio = self.user_fn(tradable_assets, history.copy(), position_history.copy())
 
         else:  # vector mode
             # compute vectorized outputs only once (or if history length changed significantly)
@@ -206,13 +230,21 @@ class FunctionStrategy(Strategy):
                 else:
                     raise StrategyError("vector mode: user function returned unsupported type")
             # fetch current target
+
+
             # If _vector_cache is a Series of scalars: return scalar for current index
             target_portfolio = self._vector_cache.loc[current_index]
 
         # validate returned target
         self._validate_target(target_portfolio)
-        return target_portfolio
+        if not isinstance(target_cash, float):
+            raise StrategyError("Cash must be returned as a float.")
 
+        
+        # Gabriel's notes: I'm thinking on whether not I should include a separate class that my Strategy class can read off and know exactly what trades it needs to make.
+
+        return target_cash, target_portfolio
+    
     def finalize(self) -> None:
         # user may want to inspect state or free heavy cached objects
         # do not clear _state by default so backtester can inspect it after finalize
@@ -230,10 +262,10 @@ class Trade:
 class Backtester:
     def __init__(self,
                 tradable_assets: List[str], 
+                strategy_fn: Callable, # The strategy function I want to test on 
+                strategy_name: str,
                 data: pd.DataFrame, # the data that the strategy operates on
-                name: str, # The name of the strategy
-                strategy_fn: Callable, # type is undecided
-                benchmark: Optional[pd.Series], 
+                # benchmark: Optional[pd.Series],  # potentially removing this benchmark argument
                 allow_short=False,
                 cash_start: float = 100_000.0,
                 commission: float = 0.0,  
@@ -246,30 +278,26 @@ class Backtester:
         
         
         
-        
-        
-        
         """
-        
+        # Change the strategy function to be compatible with Strategy Class.
+
+        # Making the code flexible enough to accept both Function Strategy inputs or callables as inputs.
+
+
         assert isinstance(data, pd.DataFrame), "Input data must be given as a pd.DataFrame indexed by date."
 
-        if benchmark is not None:
-            assert len(benchmark) == len(data)
-        
 
         # Check the data that we need for signal generation
         self.tradable_assets = tradable_assets # Check if I can optimise it here 
         self.data = data
-        self.benchmark = benchmark.copy().astype(float) if benchmark is not None else None
         self.dates = data.index
         
-        # Question for me in the future: Should 
-
-
         # Current portfolio state
-        self.start_cash = cash_start
+        self.cash_start = cash_start
+        self.current_nav = cash_start
         self.position : pd.Series = pd.Series({asset:0 for asset in self.tradable_assets})
-        self.cash = self.start_cash
+        self.current_shares: pd.Series = pd.Series({asset:0 for asset in self.tradable_assets})
+        self.cash = cash_start
 
         # execution and model parameters
         self.commission = commission
@@ -281,70 +309,82 @@ class Backtester:
 
         # history
         self.nav_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
-        self.position_history: pd.DataFrame = pd.DataFrame(np.zeros(len(self.data), len(self.tradable_assets)), 
-                                                           columns=self.tradable_assets, 
-                                                           index=self.dates
-                                                           )   # fraction of NAV invested in asset (dollars_in_asset / nav)
+        self.position_history: pd.DataFrame = pd.DataFrame(np.zeros((len(self.data), len(self.tradable_assets))), 
+                                                           columns= self.tradable_assets, 
+                                                           index= self.dates
+                                                           )  
+        self.cash_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
+        # fraction of NAV invested in asset (dollars_in_asset / nav)
         self.trades: List[Trade] = []
         self.signal_history: List[float] = []     # raw signals returned by strategy
 
-        # Change the strategy function to be compatible with Strategy Class.
-        self.strategy_fn = FunctionStrategy(name, strategy_fn, mode="event")
+        # Make the engine flexible enough that it 
+        self.strategy_object = FunctionStrategy(strategy_name, strategy_fn)
 
         # For plotting later 
         self.backtest_complete = False
+
 
         # For visualising results
         self.portfolio_returns = None
 
 
     def run(self, verbose=False):
-        self.strategy_fn.initialize()
+        self.strategy_object.initialize()
 
         pending_target = None
         T = len(self.data) 
 
+        pending_cash_frac = None 
+        pending_asset_frac = None
+
         # Starting next tick execution 
         for t in range(T):
             date = self.dates[t]
-            current_prices = self.data[t, self.tradable_assets]
+            current_prices = self.data.loc[date, self.tradable_assets]
 
-            # 1) Start with next tick execution. 
-            if self.execute_on_next_tick and pending_target:
+            # 1) record NAV and position BEFORE generating new signal or executing new trades.
+            self.current_nav = self.cash + (current_prices * self.current_shares).sum()
+            self.nav_history.loc[date] = self.current_nav
+            
+            self.cash_history[date] = self.cash
+            self.current_position = (current_prices * self.current_shares / self.current_nav) if self.current_nav != 0 else 0.0 
+            self.position_history.loc[date, :] = self.current_position
+    
+
+            # 2) Perform next tick execution. 
+            if self.execute_on_next_tick and (pending_cash_frac is not None) and (pending_asset_frac is not None):
                 if verbose:
-                    print(f"{date.date()}: executing pending target {pending_target:.3f} at price {px:.4f}")
-                self._execute_target_portfolio(pending_target, current_prices, date)
-                pending_target = None
+                    print(f"{date.date()}: executing pending target \n {pending_asset_frac}")
 
-            # 2) record NAV and position BEFORE generating new signal or executing new trades.
-            nav = self.cash + current_prices * self.position
-            self.nav_history.append(nav)
-
-            pos_frac = (current_prices * self.position / nav) if nav != 0 else 0.0 
-            self.position_history.append(pos_frac) 
+                    print(f"\nCurrent prices executed at: \n{current_prices}")
+                self._execute_target_portfolio(pending_cash_frac, pending_asset_frac, current_prices, date)
+                pending_asset_frac = None
+                pending_cash_frac= None
 
             # 3) Generate strategy signal using price history up to t
+
+            # The try except blocks are here for debugging - if the code breaks here we know that it broke here.
             try:
-                # The strategy is returned as a class of portfolio weights.
-                target_frac = float(self.strategy_fn.predict(self.data.iloc[:t+1, :], ))
+                # The strategy is returned as a class of portfolio weights. I think it only makes sense to return cash as a fraction of NAV as well.
+                pending_cash_frac, pending_asset_frac = self.strategy_object.predict(self.tradable_assets, self.data.iloc[:t+1, :], self.position_history.iloc[:t + 1, :])
 
             except Exception as e:
                 raise RuntimeError(f"Error in strategy.predict at index {t} date {date}: {e}")
-
-            # 4) Execution: Either execute trade now or execute on next tick
-            if self.execute_on_next_tick:
-                pending_target = target_frac
-            else:
+            
+            # 4) Execution: Code for executing immediately if specified in the model
+            if not self.execute_on_next_tick:
                 if verbose:
-                    print(f"{date.date()}: executing target immediately: {pending_target:.3f} at price {px:.4f}")
-                self._execute_target_portfolio(target_frac, current_prices, date)
+                    print(f"{date.date()}: executing pending target \n{pending_asset_frac}")
+                    print(f"\nCurrent prices executed at: \n{current_prices}")
+                self._execute_target_portfolio(pending_cash_frac, pending_asset_frac, current_prices, date)
                 pending_target = None
         
         # To call other plots later, must first be sure that the backtest is done.
         self.backtest_complete=True 
         return 
 
-    def _execute_target_portfolio(self, target_frac: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
+    def _execute_target_portfolio(self, target_cash: float, target_frac: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
 
         """
         Convert a target fraction into a trade and update cash/shares.
@@ -356,55 +396,85 @@ class Backtester:
             - compute trade shares = delta_dollars / trade_price
             - update shares and cash and charge commission
         """
+        assert len(target_frac) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
 
         # clamp
         if not self.allow_short:
-            target_frac = max(0.0, target_frac)
+            target_frac = target_frac.clip(lower=0, upper=1)
         else:
-            target_frac = max(-1.0, min(1.0, target_frac))
+            target_frac = target_frac.clip(lower=-1, upper=1)
 
 
-        nav = self.cash + self.position * exec_price
         # if nav is zero, we can't sensibly trade
-        if nav <= 0:
+        """
+        There needs to be error handling in this section. 
+        """
+        if self.current_nav <= 0:
+            print("Net Asset Value is now 0. No trades can occur.")
             return 
 
+        # Marked for review - don't think this is very accurate
+
         # The amount of extra cash we need to perform the trade 
-        target_dollars = target_frac * nav
-        current_dollars = self.position * exec_price
-        delta_dollars = target_dollars - current_dollars 
 
-        # Include logic to stop execution if delta dollars is greater than current cash
+        # target_dollars = target_frac * nav + target_cash * nav
+        # current_dollars = current_shares * exec_price  + target_cash * nav
+        # delta_dollars = target_dollars - current_dollars
+        
 
+        # Calculate the number of shares I want to buy of each asset, by first computing the amount I want to spend on each asset. This is because transcation costs are only added in later, before returning the final amount of shares that we bought. 
+        target_asset_value = target_frac * self.current_nav
+        target_cash_value = target_cash * self.current_nav
+        current_asset_value = self.current_position * self.current_nav
+        current_cash_value = self.cash
+
+        # I calculate the total amount I want to spend on each asset here, by subtracting my target off my current 
+        delta_asset_value = target_asset_value - current_asset_value
+        delta_cash_value = target_cash_value - current_cash_value
 
 
         # if tiny change, skip (reduce noise)
-        if abs(delta_dollars.sum()) < 1e-8 * nav:
+        if abs(delta_asset_value.sum() + delta_cash_value) < 1e-8 * self.current_nav:
             return
 
+
         # slippage: worse price depending on direction (buy => higher price, sell => lower price)
-        trade_price = exec_price * (1.0 + self.slippage * np.sign(delta_dollars))
+        trade_price = exec_price * (1.0 + self.slippage * np.sign(delta_asset_value))
 
         # trade shares (signed)
-        trade_shares = delta_dollars / trade_price
-
-        trade_value = (trade_shares * trade_price).sum()  # signed value
+        trade_shares = delta_asset_value / trade_price
+        trade_value_excess = (trade_shares * trade_price).sum()  # signed value 
+        
+        # here we need to check if we 
 
         # commission handling: fraction if <1 else flat fee
         if 0 <= self.commission < 1:
-            commission_cost = abs(trade_value) * self.commission
+            commission_cost = abs(trade_value_excess) * self.commission
         else:
             commission_cost = float(self.commission)
         
+        trade_value_excess += commission_cost
+
+        # Include logic to stop execution if delta dollars is greater than current cash
+        # For now, we include a no fill all together because of not enough cash
+        # Don't allow leverage for now
+        
+        # All that matters is if we can pay the excess costs. We will always have because we maintain a constant fraction of NAV in cash.
+
+
         # update portfolio
-        self.position += trade_shares
-        self.cash -= trade_value + commission_cost
+        if self.cash - trade_value_excess < 0:
+            #print(f"Not enough to pay the commission at time {date.date()}- trade was not executed.")
+            return
+        
+        else:
+            self.current_shares += trade_shares
+            self.cash -= trade_value_excess
 
         # record trade for auditing
         self.trades.append(Trade(date=date, shares=dict(trade_shares), price=dict(trade_price), commission=float(commission_cost)))
 
         return
-
 
 
     def current_state(self):
@@ -420,22 +490,50 @@ class Backtester:
 
     def reset(self):
         """Reset only histories, not prices/strategy/config — useful if you want to re-run with same object."""
-        self.cash = float(self.start_cash)
+        self.cash = float(self.cash_start)
         self.position = 0.0
         self.nav_history.clear()
         self.position_history.clear()
         self.trades.clear()
         self.signal_history.clear()
     
+    # Potentially abstract into a separate class specifically for visualisation. 
+
     def calculate_results(self):
         assert self.backtest_complete, ".run() method has not been called."
         
         # Calculate returns of the portfolio
         self.portfolio_returns = (self.nav_history / self.nav_history.shift(1)) - 1 
-
+        self.portfolio_returns.fillna(0)
         return
     
-    def visualise_pnl(self, target_risk):
+    def calculate_alpha(self, benchmark):
+
+        # Basic error handling - exceptions should be thrown if not completed.
+        assert self.backtest_complete, ".run() method has not been called."
+        assert self.portfolio_returns is not None, ".calculate_results() method needs to be called first"
+        assert benchmark is not None, "Benchmark needs to be loaded in before testing can properly be done."
+        
+        # Straightforward - calculating the 
+        portfolio_excess = self.portfolio_returns - self.riskfree
+        market_excess = benchmark - self.riskfree
+
+        # Prepares the x variable (market risk-adjusted returns) for regression
+        portfolio_excess_regready = sm.add_constant(market_excess)
+
+        # Fit the OLS regression
+        model = sm.OLS(portfolio_excess_regready, market_excess)
+        model.fit()
+
+        # Summarise the findings for alpha (also need to make it intepretable)
+        print("NB: The alpha value is given in the constant term. \n")
+        model.summary()
+        return
+    
+        
+    def pnl_comparison_array(self, target_risk):
+        """We want an array to plot the pnl curve for comparison with other strategies later."""
+
         assert self.backtest_complete, ".run() method has not been called."
 
         # Risk-Weighting Portfolio. 
@@ -443,20 +541,3 @@ class Backtester:
 
         return risk_adjusted_returns
     
-    def calculate_alpha(self):
-        # 
-        portfolio_excess = self.portfolio_returns - self.riskfree
-        market_excess = self.benchmark - self.riskfree
-
-        # Prepares the x variable (market risk-adjusted returns) for regression
-        portfolio_excess_new = sm.add_constant(market_excess)
-
-        # Fit the OLS regression
-        model = sm.OLS(portfolio_excess_new, market_excess)
-        model.fit()
-
-        # Summarise the findings for alpha (also need to make it intepretable)
-        print("NB: The alpha value is given in the constant term.")
-        model.summary()
-        return
-        
