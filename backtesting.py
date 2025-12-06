@@ -8,9 +8,12 @@ from dataclasses import dataclass, field, asdict
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import statsmodels.api as sm 
+import seaborn as sns
 import inspect
 
+sns.set_style("whitegrid")
 
 @dataclass
 class StrategyMeta:
@@ -266,7 +269,7 @@ class Backtester:
                 strategy_name: str,
                 data: pd.DataFrame, # the data that the strategy operates on
                 # benchmark: Optional[pd.Series],  # potentially removing this benchmark argument
-                allow_short=False,
+                allow_short=True,
                 cash_start: float = 100_000.0,
                 commission: float = 0.0,  
                 slippage: float = 0.0, 
@@ -275,8 +278,6 @@ class Backtester:
                 riskfree_per_period: float = 0.0  # per-period risk-free rate (e.g., daily)   
                  ):
         """
-        
-        
         
         """
         # Change the strategy function to be compatible with Strategy Class.
@@ -288,7 +289,7 @@ class Backtester:
 
 
         # Check the data that we need for signal generation
-        self.tradable_assets = tradable_assets # Check if I can optimise it here 
+        self.tradable_assets = tradable_assets 
         self.data = data
         self.dates = data.index
         
@@ -320,13 +321,36 @@ class Backtester:
 
         # Make the engine flexible enough that it 
         self.strategy_object = FunctionStrategy(strategy_name, strategy_fn)
+        self.strategy_name = self.strategy_object.name
+
 
         # For plotting later 
         self.backtest_complete = False
 
-
         # For visualising results
         self.portfolio_returns = None
+
+
+    # Debugging Functions 
+    def _current_state(self):
+        """Return a snapshot of current portfolio state (useful for debugging)."""
+        current_prices = self.data.loc[:, self.tradable_assets]
+        return {
+            "cash": self.cash,
+            # To dict method converts pandas Series to dictionary for easier view 
+            "shares": self.position.to_dict(),
+            "nav": self.cash + self.position * current_prices
+        }
+
+    # Another debugging function
+    def _reset(self):
+        """Reset only histories, not prices/strategy/config — useful if you want to re-run with same object."""
+        self.cash = float(self.cash_start)
+        self.position = 0.0
+        self.nav_history.clear()
+        self.position_history.clear()
+        self.trades.clear()
+        self.signal_history.clear()
 
 
     def run(self, verbose=False):
@@ -380,29 +404,35 @@ class Backtester:
                 self._execute_target_portfolio(pending_cash_frac, pending_asset_frac, current_prices, date)
                 pending_target = None
         
+
+        # Calculate backtest returns after backtest is complete.
+        self.portfolio_returns = (self.nav_history / self.nav_history.shift(1)) - 1 
+        self.portfolio_returns.fillna(0, inplace=True)
+
         # To call other plots later, must first be sure that the backtest is done.
         self.backtest_complete=True 
         return 
 
-    def _execute_target_portfolio(self, target_cash: float, target_frac: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
+
+    def _execute_target_portfolio(self, target_cash: float, target_asset_frac: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
 
         """
         Convert a target fraction into a trade and update cash/shares.
-        target_frac is clamped to [-1,1] unless allow_short is False (then clamp to [0,1]).
+        target_asset_frac is clamped to [-1,1] unless allow_short is False (then clamp to [0,1]).
         The logic:
-            - compute target dollar exposure = target_frac * NAV
+            - compute target dollar exposure = target_asset_frac * NAV
             - compute delta dollars = target_dollars - current_dollars
             - compute trade price with slippage
             - compute trade shares = delta_dollars / trade_price
             - update shares and cash and charge commission
         """
-        assert len(target_frac) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
+        assert len(target_asset_frac) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
 
         # clamp
         if not self.allow_short:
-            target_frac = target_frac.clip(lower=0, upper=1)
+            target_asset_frac = target_asset_frac.clip(lower=0, upper=1)
         else:
-            target_frac = target_frac.clip(lower=-1, upper=1)
+            target_asset_frac = target_asset_frac.clip(lower=-1, upper=1)
 
 
         # if nav is zero, we can't sensibly trade
@@ -413,40 +443,45 @@ class Backtester:
             print("Net Asset Value is now 0. No trades can occur.")
             return 
 
-        # Marked for review - don't think this is very accurate
-
-        # The amount of extra cash we need to perform the trade 
-
-        # target_dollars = target_frac * nav + target_cash * nav
+        # target_dollars = target_asset_frac * nav + target_cash * nav
         # current_dollars = current_shares * exec_price  + target_cash * nav
         # delta_dollars = target_dollars - current_dollars
         
+        # UPDATE: 4/12/25
+        # Modelling decision - we allow cash to go negative 
 
-        # Calculate the number of shares I want to buy of each asset, by first computing the amount I want to spend on each asset. This is because transcation costs are only added in later, before returning the final amount of shares that we bought. 
-        target_asset_value = target_frac * self.current_nav
+        """
+        Logic of this section:
+        1. An order is received, based on the relative weights of the portfolio wrt to net asset value
+        2. From the weights relative to NAV, calculate the number of shares we need to purchase to achieve the desired weights of the portfolio. 
+        3. 
+        
+        """
+
+        # Calculating the number of shares I want to buy of each asset (not accounting for transaction costs yet). This is done by calculating the absolute amount of cash holding in each asset desired, then dividing by the current trade price to obtain the number of shares
+
+        # Calculate the  
+        target_asset_value = target_asset_frac * self.current_nav
         target_cash_value = target_cash * self.current_nav
         current_asset_value = self.current_position * self.current_nav
-        current_cash_value = self.cash
+        current_cash_value = self.cash 
 
-        # I calculate the total amount I want to spend on each asset here, by subtracting my target off my current 
+        # I calculate the total amount I want to spend on each asset here, by subtracting my target off my current asset value
         delta_asset_value = target_asset_value - current_asset_value
         delta_cash_value = target_cash_value - current_cash_value
 
+        shares_wanted = delta_asset_value / exec_price 
 
         # if tiny change, skip (reduce noise)
         if abs(delta_asset_value.sum() + delta_cash_value) < 1e-8 * self.current_nav:
             return
 
-
         # slippage: worse price depending on direction (buy => higher price, sell => lower price)
         trade_price = exec_price * (1.0 + self.slippage * np.sign(delta_asset_value))
 
-        # trade shares (signed)
-        trade_shares = delta_asset_value / trade_price
-        trade_value_excess = (trade_shares * trade_price).sum()  # signed value 
+        # Obtain the net effect of the trade - the portfolio might sell and buy shares, and this just calculates the excess profit to subtract off cash 
+        trade_value_excess = (shares_wanted * trade_price).sum()
         
-        # here we need to check if we 
-
         # commission handling: fraction if <1 else flat fee
         if 0 <= self.commission < 1:
             commission_cost = abs(trade_value_excess) * self.commission
@@ -455,81 +490,57 @@ class Backtester:
         
         trade_value_excess += commission_cost
 
-        # Include logic to stop execution if delta dollars is greater than current cash
-        # For now, we include a no fill all together because of not enough cash
-        # Don't allow leverage for now
-        
-        # All that matters is if we can pay the excess costs. We will always have because we maintain a constant fraction of NAV in cash.
-
-
         # update portfolio
-        if self.cash - trade_value_excess < 0:
+        #if self.cash - trade_value_excess < 0:
             #print(f"Not enough to pay the commission at time {date.date()}- trade was not executed.")
-            return
+            #return
         
-        else:
-            self.current_shares += trade_shares
-            self.cash -= trade_value_excess
+        self.current_shares += shares_wanted
+        self.cash -= trade_value_excess
 
         # record trade for auditing
-        self.trades.append(Trade(date=date, shares=dict(trade_shares), price=dict(trade_price), commission=float(commission_cost)))
+        self.trades.append(Trade(date=date, shares=dict(shares_wanted), price=dict(trade_price), commission=float(commission_cost)))
 
         return
 
 
-    def current_state(self):
-        """Return a snapshot of current portfolio state (useful for debugging)."""
-        current_prices = self.data.loc[:, self.tradable_assets]
-        return {
-            "cash": self.cash,
-            # To dict method converts pandas Series to dictionary for easier view 
-            "shares": self.position.to_dict(),
-            "nav": self.cash + self.position * current_prices
-        }
-
-
-    def reset(self):
-        """Reset only histories, not prices/strategy/config — useful if you want to re-run with same object."""
-        self.cash = float(self.cash_start)
-        self.position = 0.0
-        self.nav_history.clear()
-        self.position_history.clear()
-        self.trades.clear()
-        self.signal_history.clear()
-    
-    # Potentially abstract into a separate class specifically for visualisation. 
-
-    def calculate_results(self):
-        assert self.backtest_complete, ".run() method has not been called."
-        
-        # Calculate returns of the portfolio
-        self.portfolio_returns = (self.nav_history / self.nav_history.shift(1)) - 1 
-        self.portfolio_returns.fillna(0)
-        return
-    
     def calculate_alpha(self, benchmark):
 
         # Basic error handling - exceptions should be thrown if not completed.
         assert self.backtest_complete, ".run() method has not been called."
-        assert self.portfolio_returns is not None, ".calculate_results() method needs to be called first"
-        assert benchmark is not None, "Benchmark needs to be loaded in before testing can properly be done."
+        assert len(benchmark) == len(self.portfolio_returns) 
+        #assert benchmark is not None, "Benchmark needs to be loaded in before testing can properly be done."
         
-        # Straightforward - calculating the 
+        # Straightforward - calculating the portfolio returns 
         portfolio_excess = self.portfolio_returns - self.riskfree
         market_excess = benchmark - self.riskfree
 
         # Prepares the x variable (market risk-adjusted returns) for regression
-        portfolio_excess_regready = sm.add_constant(market_excess)
+        market_excess_regready = sm.add_constant(market_excess)
 
         # Fit the OLS regression
-        model = sm.OLS(portfolio_excess_regready, market_excess)
-        model.fit()
+        model = sm.OLS(portfolio_excess, market_excess_regready).fit()
 
         # Summarise the findings for alpha (also need to make it intepretable)
+        print(f"Alpha of the strategy: {model.params[0]} \n")
         print("NB: The alpha value is given in the constant term. \n")
         model.summary()
+
         return
     
+    def plot_pnl_curve(self, figsize=(15,5)):
+        # Calculate the actual profit or loss:
+        pnl = self.nav_history - self.cash_start
+        pnl_pos = pnl.where(pnl >= 0, 0)
+        pnl_neg = pnl.where(pnl <  0, 0)
+
+        plt.figure(figsize=figsize)
+        plt.plot(pnl_pos.index, pnl_pos, color="gray", label="Profit")
+        plt.plot(pnl_neg.index, pnl_neg, color="red", label="Loss")
+        plt.title(f"PnL Chart for {self.strategy_name}")
+        plt.legend()
+        plt.show()
+        return
         
     def pnl_comparison_array(self, target_risk):
         """We want an array to plot the pnl curve for comparison with other strategies later."""
