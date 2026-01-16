@@ -58,7 +58,7 @@ class Strategy(ABC):
 
 
     @abstractmethod
-    def predict(self, history: pd.DataFrame) -> Union[float, pd.Series, Dict[str, float]]:
+    def predict(self, tradable_assets, history, position_history):
         """
         Core API that the backtester will call at each tick.
 
@@ -454,8 +454,6 @@ class Backtester:
         Logic of this section:
         1. An order is received, based on the relative weights of the portfolio wrt to net asset value
         2. From the weights relative to NAV, calculate the number of shares we need to purchase to achieve the desired weights of the portfolio. 
-        3. 
-        
         """
 
         # Calculating the number of shares I want to buy of each asset (not accounting for transaction costs yet). This is done by calculating the absolute amount of cash holding in each asset desired, then dividing by the current trade price to obtain the number of shares
@@ -551,4 +549,3 @@ class Backtester:
         risk_adjusted_returns = target_risk * self.portfolio_returns / self.portfolio_returns.std()
 
         return risk_adjusted_returns
-    
