@@ -286,9 +286,10 @@ class Backtester:
 
 
         assert isinstance(data, pd.DataFrame), "Input data must be given as a pd.DataFrame indexed by date."
-
+        
 
         # Check the data that we need for signal generation
+        
         self.tradable_assets = tradable_assets 
         self.data = data
         self.dates = data.index
@@ -458,7 +459,6 @@ class Backtester:
 
         # Calculating the number of shares I want to buy of each asset (not accounting for transaction costs yet). This is done by calculating the absolute amount of cash holding in each asset desired, then dividing by the current trade price to obtain the number of shares
 
-        # Calculate the  
         target_asset_value = target_asset_frac * self.current_nav
         target_cash_value = target_cash * self.current_nav
         current_asset_value = self.current_position * self.current_nav
@@ -470,13 +470,16 @@ class Backtester:
 
         shares_wanted = delta_asset_value / exec_price 
 
-        # if tiny change, skip (reduce noise)
-        if abs(delta_asset_value.sum() + delta_cash_value) < 1e-8 * self.current_nav:
+        # if tiny change, skip (reduce noise): 
+        if abs(delta_asset_value.sum()) + abs(delta_cash_value) < 1e-8 * self.current_nav:
+            print("Trade not executed because position rebalance was too small.")
             return
+
+        # Important to change the dynamics here - each item that is rebalanced in the portfolio should be charged for. 
 
         # slippage: worse price depending on direction (buy => higher price, sell => lower price)
         trade_price = exec_price * (1.0 + self.slippage * np.sign(delta_asset_value))
-
+        
         # Obtain the net effect of the trade - the portfolio might sell and buy shares, and this just calculates the excess profit to subtract off cash 
         trade_value_excess = (shares_wanted * trade_price).sum()
         
@@ -530,7 +533,7 @@ class Backtester:
         # Calculate the actual profit or loss:
         pnl = self.nav_history - self.cash_start
         pnl_pos = pnl.where(pnl >= 0, 0)
-        pnl_neg = pnl.where(pnl <  0, 0)
+        pnl_neg = pnl.where(pnl < 0, 0)
 
         plt.figure(figsize=figsize)
         plt.plot(pnl_pos.index, pnl_pos, color="gray", label="Profit")
