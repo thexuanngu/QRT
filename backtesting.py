@@ -26,7 +26,7 @@ class StrategyMeta:
 class StrategyError(Exception):
     pass
 
-class NotImplementedError(Exception):
+class StrategyNotImplemented(Exception):
     pass
 
 
@@ -44,9 +44,8 @@ class Strategy(ABC):
     """
 
 
-    def __init__(self, name):
+    def __init__(self):
         #self.meta = meta or StrategyMeta(name=self.__class__.__name__)
-        self.name = name
         self._state: Dict[str, Any] = {}
         self._initialized = False
 
@@ -73,7 +72,7 @@ class Strategy(ABC):
             The target portfolio. For single-asset strategies return a float (-1..1).
             For multi-asset strategies return a Series or dict mapping asset->weight.
         """
-        raise NotImplementedError
+        raise StrategyNotImplemented
 
 
     def finalize(self) -> None:
@@ -99,7 +98,7 @@ class Strategy(ABC):
         """
         Ensure target is a supported return type and numeric values are finite.
         """
-        valid_types = (float, int, pd.Series, dict)
+        valid_types = (float, int, pd.Series, dict, type(None))
         if not isinstance(target, valid_types):
             raise StrategyError(f"Unsupported target type: {type(target)}. "
                                 "Must be float, pd.Series, or dict.")
@@ -133,11 +132,10 @@ class FunctionStrategy(Strategy):
     """
 
     def __init__(self,
-                 name: str,
-                 user_fn: Callable, # MUST be a class event 
+                 user_fn: Callable, # MUST be a function 
+                 tradable_assets: Tuple[str], 
                  required_params: Tuple[str] = None,
                  optional_params: Tuple[str] = None,
-                 tradable_assets: Tuple[str] = None, 
                  mode: str = "event",
                  params: Optional[Dict[str, Any]] = None):
         """
@@ -159,7 +157,7 @@ class FunctionStrategy(Strategy):
         # Force the strategy to be a function. 
     
 
-        super().__init__(name=name)
+        super().__init__()
         self.user_fn = user_fn
         self.required_params = required_params
         self.optional_params = optional_params
@@ -240,7 +238,7 @@ class FunctionStrategy(Strategy):
 
         # validate returned target
         self._validate_target(target_portfolio)
-        if not isinstance(target_cash, float):
+        if not isinstance(target_cash, (float, type(None))):
             raise StrategyError("Cash must be returned as a float.")
 
         
@@ -253,6 +251,7 @@ class FunctionStrategy(Strategy):
         # do not clear _state by default so backtester can inspect it after finalize
         pass
 
+
 @dataclass
 class Trade:
     date: pd.Timestamp
@@ -262,13 +261,12 @@ class Trade:
     note: Optional[str] = None
 
 
+
 class Backtester:
     def __init__(self,
                 tradable_assets: List[str], 
-                strategy_fn: Callable, # The strategy function I want to test on 
-                strategy_name: str,
+                strategy_fn: Strategy, # The strategy function I want to test on 
                 data: pd.DataFrame, # the data that the strategy operates on
-                # benchmark: Optional[pd.Series],  # potentially removing this benchmark argument
                 allow_short=True,
                 cash_start: float = 100_000.0,
                 commission: float = 0.0,  
@@ -276,22 +274,19 @@ class Backtester:
                 execute_on_next_tick: bool = True,
                 periods_per_year: int = 252,  # used for annualization
                 riskfree_per_period: float = 0.0  # per-period risk-free rate (e.g., daily)   
-                 ):
+                ):
         """
         
         """
-        # Change the strategy function to be compatible with Strategy Class.
-
-        # Making the code flexible enough to accept both Function Strategy inputs or callables as inputs.
-
 
         assert isinstance(data, pd.DataFrame), "Input data must be given as a pd.DataFrame indexed by date."
         
 
         # Check the data that we need for signal generation
-        
         self.tradable_assets = tradable_assets 
         self.data = data
+
+        ## need to force that the data index is in the form of dates
         self.dates = data.index
         
         # Current portfolio state
@@ -311,19 +306,15 @@ class Backtester:
 
         # history
         self.nav_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
-        self.position_history: pd.DataFrame = pd.DataFrame(np.zeros((len(self.data), len(self.tradable_assets))), 
-                                                           columns= self.tradable_assets, 
-                                                           index= self.dates
-                                                           )  
+        self.position_history: pd.DataFrame = pd.DataFrame(np.zeros((len(self.data), len(self.tradable_assets))),  columns= self.tradable_assets, index= self.dates)                            
         self.cash_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
         # fraction of NAV invested in asset (dollars_in_asset / nav)
         self.trades: List[Trade] = []
         self.signal_history: List[float] = []     # raw signals returned by strategy
 
         # Make the engine flexible enough that it 
-        self.strategy_object = FunctionStrategy(strategy_name, strategy_fn)
+        self.strategy_object = strategy_fn
         self.strategy_name = self.strategy_object.name
-
 
         # For plotting later 
         self.backtest_complete = False
@@ -380,9 +371,9 @@ class Backtester:
             # 2) Perform next tick execution. 
             if self.execute_on_next_tick and (pending_cash_frac is not None) and (pending_asset_frac is not None):
                 if verbose:
-                    print(f"{date.date()}: executing pending target \n {pending_asset_frac}")
+                    print(f"{date.date()}: executing pending target\n{pending_asset_frac}")
 
-                    print(f"\nCurrent prices executed at: \n{current_prices}")
+                    print(f"Current prices executed at: \n{current_prices}\n")
                 self._execute_target_portfolio(pending_cash_frac, pending_asset_frac, current_prices, date)
                 pending_asset_frac = None
                 pending_cash_frac= None
@@ -407,9 +398,8 @@ class Backtester:
         
 
         # Calculate backtest returns after backtest is complete.
-        self.portfolio_returns = (self.nav_history / self.nav_history.shift(1)) - 1 
-        self.portfolio_returns.fillna(0, inplace=True)
-
+        self.portfolio_returns = ( (self.nav_history) / (self.nav_history.shift(1)) - 1).dropna()
+        
         # To call other plots later, must first be sure that the backtest is done.
         self.backtest_complete=True 
         return 
@@ -503,52 +493,3 @@ class Backtester:
         self.trades.append(Trade(date=date, shares=dict(shares_wanted), price=dict(trade_price), commission=float(commission_cost)))
 
         return
-
-
-    def calculate_alpha(self, benchmark):
-
-        # Basic error handling - exceptions should be thrown if not completed.
-        assert self.backtest_complete, ".run() method has not been called."
-        assert len(benchmark) == len(self.portfolio_returns) 
-        #assert benchmark is not None, "Benchmark needs to be loaded in before testing can properly be done."
-        
-        # Straightforward - calculating the portfolio returns 
-        portfolio_excess = self.portfolio_returns - self.riskfree
-        market_excess = benchmark - self.riskfree
-
-        # Prepares the x variable (market risk-adjusted returns) for regression
-        market_excess_regready = sm.add_constant(market_excess)
-
-        # Fit the OLS regression
-        model = sm.OLS(portfolio_excess, market_excess_regready).fit()
-
-        # Summarise the findings for alpha (also need to make it intepretable)
-        print(f"Alpha of the strategy: {model.params[0]} \n")
-        print("NB: The alpha value is given in the constant term. \n")
-        model.summary()
-
-        return
-    
-    def plot_pnl_curve(self, figsize=(15,5)):
-        # Calculate the actual profit or loss:
-        pnl = self.nav_history - self.cash_start
-        pnl_pos = pnl.where(pnl >= 0, 0)
-        pnl_neg = pnl.where(pnl < 0, 0)
-
-        plt.figure(figsize=figsize)
-        plt.plot(pnl_pos.index, pnl_pos, color="gray", label="Profit")
-        plt.plot(pnl_neg.index, pnl_neg, color="red", label="Loss")
-        plt.title(f"PnL Chart for {self.strategy_name}")
-        plt.legend()
-        plt.show()
-        return
-        
-    def pnl_comparison_array(self, target_risk):
-        """We want an array to plot the pnl curve for comparison with other strategies later."""
-
-        assert self.backtest_complete, ".run() method has not been called."
-
-        # Risk-Weighting Portfolio. 
-        risk_adjusted_returns = target_risk * self.portfolio_returns / self.portfolio_returns.std()
-
-        return risk_adjusted_returns
