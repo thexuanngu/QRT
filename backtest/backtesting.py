@@ -366,6 +366,7 @@ class Backtester:
     def __init__(self,
                 tradable_assets: List[str], 
                 strategy_fn: Strategy, # The strategy function I want to test on 
+                strategy_name: str, # The name of the strategy for plotting
                 data: pd.DataFrame, # the data that the strategy operates on
                 allow_short=True,
                 cash_start: float = 100_000.0,
@@ -413,7 +414,7 @@ class Backtester:
 
         # Make the engine flexible enough that it 
         self.strategy_object = strategy_fn
-        self.strategy_name = self.strategy_object.name
+        self.strategy_name = strategy_name
 
         # For plotting later 
         self.backtest_complete = False
@@ -424,7 +425,7 @@ class Backtester:
 
     # Debugging Functions 
     def _current_state(self):
-        """Return a snapshot of current portfolio state (useful for debugging)."""
+        # Return a snapshot of current portfolio state (useful for debugging).
         current_prices = self.data.loc[:, self.tradable_assets]
         return {
             "cash": self.cash,
@@ -435,7 +436,7 @@ class Backtester:
 
     # Another debugging function
     def _reset(self):
-        """Reset only histories, not prices/strategy/config — useful if you want to re-run with same object."""
+        # Reset only histories, not prices/strategy/config — useful if you want to re-run with same object.
         self.cash = float(self.cash_start)
         self.position = 0.0
         self.nav_history.clear()
@@ -518,16 +519,16 @@ class Backtester:
 
     def _execute_target_portfolio(self, target_cash: float, target_asset_frac: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
 
-        """
-        Convert a target fraction into a trade and update cash/shares.
-        target_asset_frac is clamped to [-1,1] unless allow_short is False (then clamp to [0,1]).
-        The logic:
-            - compute target dollar exposure = target_asset_frac * NAV
-            - compute delta dollars = target_dollars - current_dollars
-            - compute trade price with slippage
-            - compute trade shares = delta_dollars / trade_price
-            - update shares and cash and charge commission
-        """
+        # """
+        # Convert a target fraction into a trade and update cash/shares.
+        # target_asset_frac is clamped to [-1,1] unless allow_short is False (then clamp to [0,1]).
+        # The logic:
+        #     - compute target dollar exposure = target_asset_frac * NAV
+        #     - compute delta dollars = target_dollars - current_dollars
+        #     - compute trade price with slippage
+        #     - compute trade shares = delta_dollars / trade_price
+        #     - update shares and cash and charge commission
+        # """
         assert len(target_asset_frac) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
 
         # clamp
@@ -538,9 +539,9 @@ class Backtester:
 
 
         # if nav is zero, we can't sensibly trade
-        """
-        There needs to be error handling in this section. 
-        """
+        # """
+        # There needs to be error handling in this section. 
+        # """
         if self.current_nav <= 0:
             print("Net Asset Value is now 0. No trades can occur.")
             return 
@@ -552,11 +553,11 @@ class Backtester:
         # UPDATE: 4/12/25
         # Modelling decision - we allow cash to go negative 
 
-        """
-        Logic of this section:
-        1. An order is received, based on the relative weights of the portfolio wrt to net asset value
-        2. From the weights relative to NAV, calculate the number of shares we need to purchase to achieve the desired weights of the portfolio. 
-        """
+        # """
+        # Logic of this section:
+        # 1. An order is received, based on the relative weights of the portfolio wrt to net asset value
+        # 2. From the weights relative to NAV, calculate the number of shares we need to purchase to achieve the desired weights of the portfolio. 
+        # """
 
         # Calculating the number of shares I want to buy of each asset (not accounting for transaction costs yet). This is done by calculating the absolute amount of cash holding in each asset desired, then dividing by the current trade price to obtain the number of shares
 
