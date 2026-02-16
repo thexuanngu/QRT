@@ -30,6 +30,16 @@ class StrategyNotImplemented(Exception):
     pass
 
 
+@dataclass
+class Trade:
+    date: pd.Timestamp
+    shares: float
+    price: float
+    commission: float
+    note: Optional[str] = None
+
+
+
 class Strategy(ABC):
     """
     Abstract base Strategy class.
@@ -246,17 +256,6 @@ class FunctionStrategy(Strategy):
         # do not clear _state by default so backtester can inspect it after finalize
         pass
 
-
-@dataclass
-class Trade:
-    date: pd.Timestamp
-    shares: float
-    price: float
-    commission: float
-    note: Optional[str] = None
-
-
-
 class Backtester:
     """
     
@@ -410,7 +409,7 @@ class Backtester:
         self.cash_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
         # fraction of NAV invested in asset (dollars_in_asset / nav)
         self.trades: List[Trade] = []
-        self.signal_history: List[float] = []     # raw signals returned by strategy
+        self.signal_history: List = []     # raw signals returned by strategy
 
         # Make the engine flexible enough that it 
         self.strategy_object = strategy_fn
@@ -431,7 +430,7 @@ class Backtester:
             "cash": self.cash,
             # To dict method converts pandas Series to dictionary for easier view 
             "shares": self.position.to_dict(),
-            "nav": self.cash + self.position * current_prices
+            "nav": self.cash + (self.position * current_prices).sum()
         }
 
     # Another debugging function
@@ -499,6 +498,8 @@ class Backtester:
 
             except Exception as e:
                 raise RuntimeError(f"Error in strategy.predict at index {t} date {date}: {e}")
+            
+            self.signal_history.append(pending_asset_frac)
             
             # 4) Execution: Code for executing immediately if specified in the model
             if not self.execute_on_next_tick:
