@@ -35,6 +35,7 @@ class VisualiseBacktestResults:
         # benchmark performance metrics 
         self._strategy_metrics = dict((metric, None) for metric in self._performance_metrics)
         self._benchmark_metrics = dict((metric, None) for metric in self._performance_metrics)
+        self._drawdown = pd.Series(dtype=float)
         
     def _calculate_pnl(self):
         # basic performance metrics - cagr and pnl 
@@ -45,7 +46,12 @@ class VisualiseBacktestResults:
 
         num_years = (nav.index[-1] - nav.index[0]).days / 365.25
         cagr = (final_nav / start_nav) ** (1 / num_years) - 1 
-        return dict(net_nav=net_nav, cagr=cagr)
+        self._strategy_metrics["net_nav"] = net_nav
+        self._strategy_metrics["cagr"] = cagr
+        return dict(
+            net_nav=self._strategy_metrics["net_nav"],
+            cagr=self._strategy_metrics["cagr"],
+        )
 
 
     def _calculate_drawdown(self):
@@ -53,7 +59,9 @@ class VisualiseBacktestResults:
         nav = self.backtester.nav_history
         rolling_max = nav.cummax()
         drawdown = (nav - rolling_max) / rolling_max
+        self._drawdown = drawdown
         max_drawdown = drawdown.min()
+        self._strategy_metrics["max_drawdown"] = max_drawdown
 
         # Max Drawdown Duration
         end_of_drawdown = drawdown[drawdown == 0].index
@@ -64,25 +72,29 @@ class VisualiseBacktestResults:
             duration = end - start
             if duration > max_duration:
                 max_duration = duration
-        self._max_drawdown_duration = max_duration
+        self._strategy_metrics["max_drawdown_duration"] = max_duration
 
         # Average Drawdown
-        self._average_drawdown = drawdown[drawdown < 0].mean()
+        self._strategy_metrics["average_drawdown"] = drawdown[drawdown < 0].mean()
 
-        return dict(max_drawdown=max_drawdown, max_drawdown_duration=self._max_drawdown_duration, average_drawdown=self._average_drawdown)
+        return dict(
+            max_drawdown=self._strategy_metrics["max_drawdown"],
+            max_drawdown_duration=self._strategy_metrics["max_drawdown_duration"],
+            average_drawdown=self._strategy_metrics["average_drawdown"],
+        )
     
 
     def _calculate_performance_metrics(self):
         returns = self.backtester.portfolio_returns
-        self._sharpe = returns.mean() / returns.std() * np.sqrt(252)  # Annualized Sharpe Ratio
+        self._strategy_metrics["sharpe"] = returns.mean() / returns.std() * np.sqrt(252)  # Annualized Sharpe Ratio
 
         # Sortino Ratio
         negative_returns = returns[returns < 0]
         downside_deviation = negative_returns.std()
-        self._sortiono = returns.mean() / downside_deviation * np.sqrt(252)
+        self._strategy_metrics["sortino"] = returns.mean() / downside_deviation * np.sqrt(252)
 
         # Calmar ratio 
-        self._calmar = returns.mean() / abs(self._max_drawdown)
+        self._strategy_metrics["calmar"] = returns.mean() / abs(self._strategy_metrics["max_drawdown"])
 
         return 
 
@@ -100,8 +112,9 @@ class VisualiseBacktestResults:
 
         # Top: equity curve (rows 0–2, all columns)
         ax_pnl = fig.add_subplot(gs[0:3, 0:6])
-        ax_pnl.plot(self.backtester.nav_history.index, self.backtester.nav_history - self.backtester.nav_history.iloc[0], color="blue")
-        ax_pnl.fill_between(self.backtester.nav_history.index, 0, self.backtester.nav_history - self.backtester.nav_history.iloc[0], color="lightblue", alpha=0.5)
+        ax_pnl.plot(self.backtester.nav_history.index, self.backtester.nav_history - self.backtester.nav_history.iloc[0], color="blue", label=self.backtester.strategy_name)
+        ax_pnl.plot(self.benchmark.nav_history.index, self.benchmark.nav_history - self.benchmark.nav_history.iloc[0], color="orange", linestyle="--", label=self.benchmark.strategy_name)
+        ax_pnl.legend()
         ax_pnl.set_title("Total PnL Over Time")
 
         # Middle: drawdown (row 3, all columns)
@@ -109,17 +122,17 @@ class VisualiseBacktestResults:
         ax_drawdown.plot(self._drawdown.index, self._drawdown, color="red")
         ax_drawdown.fill_between(self._drawdown.index, 0, self._drawdown, color="salmon", alpha=0.5)
         ax_drawdown.set_title("Drawdown Over Time")
-        ax_drawdown.axhline(y=self._max_drawdown, color='black', linestyle='--', label='Max Drawdown')
+        ax_drawdown.axhline(y=self._strategy_metrics["max_drawdown"], color='black', linestyle='--', label='Max Drawdown')
 
         # Bottom-right: metrics card (rows 4–5, cols 0–2)
         ax_metrics = fig.add_subplot(gs[4:6, 0:2])
-        metrics_text = f'''CAGR: {self._cagr}%
-        \nSharpe: {self._sharpe: .4f}
-        \nSortino: {self._sortiono: .4f}
-        \nCalmar: {self._calmar: .4f}
-        \nMax Drawdown: {self._max_drawdown: .4f}
-        \nMax Drawdown Duration: {self._max_drawdown_duration}
-        \nAverage Drawdown: {self._average_drawdown: .4f}'''
+        metrics_text = f'''CAGR: {self._strategy_metrics["cagr"]:.2%}
+        \nSharpe: {self._strategy_metrics["sharpe"]: .4f}
+        \nSortino: {self._strategy_metrics["sortino"]: .4f}
+        \nCalmar: {self._strategy_metrics["calmar"]: .4f}
+        \nMax Drawdown: {self._strategy_metrics["max_drawdown"]: .4f}
+        \nMax Drawdown Duration: {self._strategy_metrics["max_drawdown_duration"]}
+        \nAverage Drawdown: {self._strategy_metrics["average_drawdown"]: .4f}'''
 
         ax_metrics.text(0.00, 0.98, metrics_text,
         transform=ax_metrics.transAxes,

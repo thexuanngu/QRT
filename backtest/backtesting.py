@@ -10,7 +10,7 @@ import statsmodels.api as sm
 import seaborn as sns
 import inspect
 
-from backtest.data_models import Trade
+from backtest.data_models import Trade, TradingState
 from backtest.strategy import Strategy, FunctionStrategy
 
 sns.set_style("whitegrid")
@@ -194,6 +194,22 @@ class Backtester:
             "nav": self.cash + (self.position * current_prices).sum()
         }
 
+    def _build_trading_state(self, date: pd.Timestamp) -> TradingState:
+        # Build a snapshot of all required state for strategy decision-making.
+        nav_history_upto_today = self.nav_history.loc[:date].copy()
+
+        position_history_upto_today = self.shares_history.loc[:date].copy()
+
+        return TradingState(
+            position_history=position_history_upto_today,
+            nav_history=nav_history_upto_today,
+            current_date=date,
+            current_shares=self.current_shares.copy(),
+            current_nav=self.current_nav,
+            trade_history=list(self.trades),
+            signal_history=list(self.signal_history),
+        )
+
     # Another debugging function
     def _reset(self):
         # Reset only histories, not prices/strategy/config — useful if you want to re-run with same object.
@@ -226,10 +242,11 @@ class Backtester:
         pnl_from_positions = (self.current_shares * asset_returns).sum()
         self.cash += pnl_from_positions
 
-    def _calculate_delta_asset_value(self, target_asset_value: pd.Series, current_asset_value: pd.Series) -> pd.Series:
+    def _calculate_delta_asset_value(self, target_asset_amt: pd.Series, target_cash_amt: float) -> pd.Series:
+        assert (target_cash_amt + target_asset_amt.sum()) - self.current_nav < 1e-6, "Target portfolio is not self-financing. Please ensure that the total dollar amount of the target portfolio equals current NAV for this backtesting engine to work."
         # Encapsulated delta between desired and current dollar exposure per asset.
         # Positive values indicate buy pressure, negative values indicate sell pressure.
-        return target_asset_value - current_asset_value
+        return target_cash_amt - self.cash, target_asset_amt - self.current_shares
 
     def _calculate_commission(self, delta_asset_value: pd.Series) -> pd.Series:
         # Encapsulated commission model.
@@ -241,11 +258,7 @@ class Backtester:
         else:
             commission_dollars = pd.Series(0.0, index=delta_asset_value.index)
             commission_dollars.loc[nonzero_trade_mask] = float(self.commission)
-        return commission_dollars
 
-    def _subtract_commission_from_cash(self, commission_dollars: pd.Series) -> float:
-        # Encapsulated commission cash deduction.
-        # Returns the deducted amount for downstream logging or bookkeeping.
         commission_total = float(commission_dollars.sum())
         self.cash -= commission_total
         return commission_total
@@ -253,19 +266,13 @@ class Backtester:
     def _calculate_slippage(self, exec_price: pd.Series, delta_asset_value_after_commission: pd.Series) -> pd.Series:
         # Encapsulated slippage model.
         # Buys pay higher execution prices and sells receive lower execution prices.
-        return exec_price * (1.0 + self.slippage * np.sign(delta_asset_value_after_commission))
-
-    def _calculate_slippage_cost(self, delta_asset_value_after_commission: pd.Series) -> pd.Series:
-        # Encapsulated dollar slippage cost under notional trading.
-        # Slippage is charged on absolute traded notional for buys and sells.
-        return delta_asset_value_after_commission.abs() * self.slippage
-
-    def _subtract_slippage_from_cash(self, slippage_dollars: pd.Series) -> float:
-        # Encapsulated slippage cash deduction.
-        # Returns the deducted amount for downstream logging or bookkeeping.
-        slippage_total = float(slippage_dollars.sum())
-        self.cash -= slippage_total
-        return slippage_total
+        assert(exec_price > 0).all(), "Execution prices must be positive for slippage calculation."
+        shares_wanted = delta_asset_value_after_commission / exec_price
+        slippage_prices = exec_price * (1.0 + self.slippage * np.sign(delta_asset_value_after_commission))
+        
+        slippage_cost = (slippage_prices - exec_price) * shares_wanted
+        self.cash -= slippage_cost.sum()
+        return slippage_prices, slippage_cost
 
 
     def run(self, verbose=False):
@@ -287,7 +294,7 @@ class Backtester:
         T = len(self.data) 
         previous_prices = None
 
-        pending_cash_frac = None 
+        pending_cash_amount = None 
         pending_asset_amount = None
 
         # Starting next tick execution 
@@ -296,44 +303,49 @@ class Backtester:
             self.current_date = date
             current_prices = self.data.loc[date, self.tradable_assets]
 
-            # 1) Mark-to-market PnL from existing constant-dollar notionals into cash.
+            # Mark-to-market PnL from existing constant-dollar notionals into cash.
             self._mark_to_market_constant_notional(current_prices, previous_prices)
-        
-            # 2) Perform next tick execution. 
-            if self.execute_on_next_tick and (pending_cash_frac is not None) and (pending_asset_amount is not None):
+
+            # NAV Calculation
+            self._calculate_end_of_day_nav(date, current_prices)
+
+            # Perform next tick execution (if enabled) 
+            if self.execute_on_next_tick and (pending_cash_amount is not None) and (pending_asset_amount is not None):
                 if verbose:
                     print(f"{date.date()}: executing pending target\n{pending_asset_amount}")
 
                     print(f"Current prices executed at: \n{current_prices}\n")
-                self._execute_target_portfolio(pending_cash_frac, pending_asset_amount, current_prices, date)
+                self._execute_target_portfolio(pending_cash_amount, pending_asset_amount, current_prices, date)
                 
                 pending_asset_amount = None
-                pending_cash_frac= None
+                pending_cash_amount= None
 
-            # 3) Generate strategy signal using price history up to t
+            # Generate strategy signal using price history up to today
             try:
+                trading_state = self._build_trading_state(date)
                 # Predict desired asset amount
-                pending_cash_frac, pending_asset_amount = self.strategy_object.predict(
-                    self.tradable_assets, 
-                    self.data.loc[:date, self.tradable_assets], 
-                    self.shares_history.loc[:date, self.tradable_assets],
+                pending_cash_amount, pending_asset_amount = self.strategy_object.predict(
+                    self.tradable_assets,  # tradable assets
+                    self.data.loc[:date],  # data
+                    trading_state, # trading state
                     )
 
             except Exception as e:
-                raise RuntimeError(f"Error in strategy.predict at index {t} date {date}: {e}")
+                pending_cash_amount, pending_asset_amount = None, None
+                print(f"Error in strategy.predict at index {t} date {date}: {e} - Loop continuing")
             
             self.signal_history.append(pending_asset_amount)
             
-            # Immedaite execution
+            # Immediate execution
             if not self.execute_on_next_tick:
                 if verbose:
                     print(f"{date.date()}: executing pending target \n{pending_asset_amount}")
                     print(f"\nCurrent prices executed at: \n{current_prices}")
-                self._execute_target_portfolio(pending_cash_frac, pending_asset_amount, current_prices, date)
-                pending_target = None
+                self._execute_target_portfolio(pending_cash_amount, pending_asset_amount, current_prices, date)
+                pending_asset_amount = None
+                pending_cash_amount = None
 
             # Record end-of-day NAV, shares and cash in one encapsulated call.
-            self._calculate_end_of_day_nav(date, current_prices)
             previous_prices = current_prices.copy()
             
         # Calculate backtest returns after backtest is complete.
@@ -344,33 +356,23 @@ class Backtester:
         return 
 
 
-    def _execute_target_portfolio(self, target_cash: float, target_asset_amt: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
+    def _execute_target_portfolio(self, target_cash_amt: float, target_asset_amt: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
 
         target_asset_amt = pd.Series(target_asset_amt, index=exec_price.index, dtype=float)
         assert len(target_asset_amt) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
 
+        note = "\n"
+
         if not self.allow_short:
             target_asset_amt = target_asset_amt.clip(lower=0)
+            note += "Shorting not allowed, so negative asset amounts clipped to 0.\n"
 
-
-        # if nav is zero, we can't sensibly trade
-        # """
-        # There needs to be error handling in this section. 
-        # """
         if self.current_nav <= 0:
-            print("Net Asset Value is now 0. No trades can occur.")
+            note = "Net Asset Value is now 0. No trades can occur.\n"
             return 
 
-        # target_asset_amt is now an absolute dollar amount in each asset.
-        # target_cash remains a fraction of NAV to keep compatibility with current strategy API.
-        target_asset_value = target_asset_amt
-        target_cash_value = target_cash 
-        current_asset_value = self.current_shares
-        current_cash_value = self.cash 
-
         # 1) Dollar changes needed per asset to reach target asset dollars
-        delta_asset_value = self._calculate_delta_asset_value(target_asset_value, current_asset_value)
-        delta_cash_value = target_cash_value - current_cash_value
+        delta_asset_value, delta_cash_value = self._calculate_delta_asset_value(target_asset_amt, target_cash_amt)
         
         # if tiny change, skip (reduce noise): 
         if abs(delta_asset_value.sum()) + abs(delta_cash_value) < 1e-8 * self.current_nav:
@@ -378,21 +380,20 @@ class Backtester:
             return
 
         # 2) Compute commission per stock in dollar space.
-        #    Commission is charged to cash only and does not change the target notionals.
         commission_dollars = self._calculate_commission(delta_asset_value)
-        commission_total = self._subtract_commission_from_cash(commission_dollars)
 
         # slippage: worse price depending on direction (buy => higher price, sell => lower price)
-        trade_price = self._calculate_slippage(exec_price, delta_asset_value)
-        slippage_dollars = self._calculate_slippage_cost(delta_asset_value)
-        slippage_total = self._subtract_slippage_from_cash(slippage_dollars)
+        trade_price, slippage_dollars = self._calculate_slippage(exec_price, delta_asset_value)
 
         # Under constant notional trading, we rebalance dollar notionals directly.
-        # Variable names are preserved for compatibility with existing engine code.
-        delta_shares_wanted = delta_asset_value
-        self.current_shares += delta_shares_wanted
+        # 
+        if not self._check_position_limits(target_asset_amt):
+            delta_shares_wanted = pd.Series(0.0, index=target_asset_amt.index)
+            note += "Trade rejected by position limits.\n"
+        else:
+            delta_shares_wanted = delta_asset_value
+            self.current_shares += delta_shares_wanted
 
-        # 2) Deduct transaction costs from cash via encapsulated cost handlers.
 
         # record trade for auditing
         self.trades.append(
@@ -400,8 +401,34 @@ class Backtester:
                 date=date,
                 shares=dict(delta_shares_wanted),
                 price=dict(trade_price),
-                commission=commission_total + slippage_total,
+                commission=commission_dollars + slippage_dollars,
+                note = note
             )
         )
 
         return
+
+    def _check_position_limits(self, target_asset_amt):
+        if (target_asset_amt.abs() > 2e6).any():
+            return False
+        return True 
+
+
+from backtest.benchmarks import BuyAndHold
+
+data = pd.DataFrame({
+    "NVDA": [100, 110, 120, 130, 140],
+    "AAPL": [200, 190, 195, 205, 210]
+}, index=pd.date_range(start="2020-01-01", periods=5))
+tickers = data.columns
+
+buy_and_hold = BuyAndHold(1e6)
+backtester_buy_and_hold = Backtester(
+    data=data,
+    strategy_fn=buy_and_hold,
+    strategy_name="Buy and Hold",
+    tradable_assets=tickers,
+    cash_start=1000000,
+    slippage=0.05)
+
+# Test commission calculator

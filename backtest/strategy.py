@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.exceptions import StrategyError, StrategyNotImplemented
+from backtest.data_models import TradingState
 
 
 class Strategy(ABC):
@@ -29,7 +30,7 @@ class Strategy(ABC):
         self._initialized = True
 
     @abstractmethod
-    def predict(self, tradable_assets, history, position_history):
+    def predict(self, tradable_assets, history, trading_state: TradingState):
         """
         Core API that the backtester will call at each tick.
         Raises StrategyNotImplemented if not implemented yet.
@@ -107,7 +108,7 @@ class FunctionStrategy(Strategy):
         self._state = {}
         self._vector_cache = None
 
-    def predict(self, tradable_assets, history, position_history):
+    def predict(self, tradable_assets, history, trading_state: TradingState):
         """
         Return the target portfolio for the current tick.
         """
@@ -126,20 +127,27 @@ class FunctionStrategy(Strategy):
                 target_cash, target_portfolio = self.user_fn(
                     tradable_assets,
                     history.copy(),
-                    position_history.copy(),
+                    trading_state,
                     self._state,
                 )
             except TypeError:
-                target_cash, target_portfolio = self.user_fn(
-                    tradable_assets,
-                    history.copy(),
-                    position_history.copy(),
-                )
+                try:
+                    target_cash, target_portfolio = self.user_fn(
+                        tradable_assets,
+                        history.copy(),
+                        trading_state,
+                    )
+                except TypeError:
+                    target_cash, target_portfolio = self.user_fn(
+                        tradable_assets,
+                        history.copy(),
+                        trading_state.position_history.copy(),
+                    )
             except AttributeError:
                 target_cash, target_portfolio = self.user_fn(
                     tradable_assets,
                     history.copy(),
-                    position_history.copy(),
+                    trading_state,
                 )
         else:
             if self._vector_cache is None or len(self._vector_cache) < len(history):
