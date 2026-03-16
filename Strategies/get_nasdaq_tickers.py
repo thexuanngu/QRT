@@ -20,8 +20,9 @@ def get_nasdaq_tickers():
     response = requests.get(url, headers=headers)
     html = response.text
 
+    import io
     # read_html from raw HTML instead of URL
-    tables = pd.read_html(html)
+    tables = pd.read_html(io.StringIO(html))
 
     # The current constituents of the NASDAQ 100:
     current_const = tables[4]["Ticker"]
@@ -31,11 +32,10 @@ def get_nasdaq_tickers():
 
     # The historical constituents of the NASDAQ 100:
     historical_const = tables[5]
-    historical_const
 
     # When converting strings to datetime objects, pandas defaults to adding a midnight timestamp.
     # To remove the time part, we can use the .dt.date accessor, which returns Python's datetime.date objects.
-    historical_const.loc[:, ("Date", "Date")] = pd.to_datetime(historical_const.loc[:, ("Date", "Date")], format="%B %d, %Y").dt.date
+    historical_const["Date", "Date"] = pd.to_datetime(historical_const["Date", "Date"])
     #print(historical_const.head())
 
     # Set the date column as the index of the DataFrame
@@ -44,7 +44,7 @@ def get_nasdaq_tickers():
     # The next block of code is to get all the tickers of the historical constituents that have been removed.
 
     # Convert the string date to a datetime object to allow for comparison
-    date_considered = pd.to_datetime("2015-01-01").date()
+    date_considered = pd.to_datetime("2015-01-01")
 
     # Filter the DataFrame to include only rows where the date is after the date_considered
     historical_const = historical_const[historical_const.index > date_considered]
