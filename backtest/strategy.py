@@ -120,11 +120,10 @@ class FunctionStrategy(Strategy):
 
         current_index = history.index[-1]
 
-        target_cash = None
         target_portfolio = None
         if self.mode == "event":
             try:
-                target_cash, target_portfolio = self.user_fn(
+                target_portfolio = self.user_fn(
                     tradable_assets,
                     history.copy(),
                     trading_state,
@@ -132,19 +131,19 @@ class FunctionStrategy(Strategy):
                 )
             except TypeError:
                 try:
-                    target_cash, target_portfolio = self.user_fn(
+                    target_portfolio = self.user_fn(
                         tradable_assets,
                         history.copy(),
                         trading_state,
                     )
                 except TypeError:
-                    target_cash, target_portfolio = self.user_fn(
+                    target_portfolio = self.user_fn(
                         tradable_assets,
                         history.copy(),
                         trading_state.position_history.copy(),
                     )
             except AttributeError:
-                target_cash, target_portfolio = self.user_fn(
+                target_portfolio = self.user_fn(
                     tradable_assets,
                     history.copy(),
                     trading_state,
@@ -167,10 +166,7 @@ class FunctionStrategy(Strategy):
             target_portfolio = self._vector_cache.loc[current_index]
 
         self._validate_target(target_portfolio)
-        if not isinstance(target_cash, (float, type(None))):
-            raise StrategyError("Cash must be returned as a float.")
-
-        return target_cash, target_portfolio
+        return target_portfolio
 
     def finalize(self) -> None:
         pass

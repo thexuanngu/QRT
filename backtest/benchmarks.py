@@ -23,4 +23,4 @@ class BuyAndHold(Strategy):
             raise StrategyError("No tradable assets available for BuyAndHold strategy.")
 
         # Hold existing positions (no changes)
-        return 0, pd.Series([self.notional_amount / len(tradable_assets)] * len(tradable_assets), index=tradable_assets)
+        return pd.Series([self.notional_amount / len(tradable_assets)] * len(tradable_assets), index=tradable_assets)

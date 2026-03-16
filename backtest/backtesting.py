@@ -1,8 +1,6 @@
 # (Trimmed snippet — use the full code run above for direct copy)
 
 from typing import List
-
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -126,24 +124,25 @@ class Backtester:
                 strategy_fn: Strategy, # The strategy function I want to test on 
                 strategy_name: str, # The name of the strategy for plotting
                 data: pd.DataFrame, # the data that the strategy operates on
+                prices: pd.DataFrame,  # the price data that the strategy trades on (must be subset of data)
                 allow_short=True,
                 cash_start: float = 100_000.0,
                 commission: float = 0.0,  
                 slippage: float = 0.0, 
                 execute_on_next_tick: bool = True,
-                periods_per_year: int = 252,  # used for annualization
-                riskfree_per_period: float = 0.0  # per-period risk-free rate (e.g., daily)   
                 ):
         
         
-
+        assert isinstance(strategy_fn, Strategy), "Please wrap your strategy function into a Strategy object before inputting into the backtesting engine."
         assert isinstance(data, pd.DataFrame), "Input data must be given as a pd.DataFrame indexed by date."
         assert isinstance(data.index, pd.DatetimeIndex), "Input data index must be a pd.DatetimeIndex."
         
+        assert(set(tradable_assets).issubset(set(prices.columns))), "All tradable assets must be columns in the input data. Please check your input data and tradable assets list."
 
         # Check the data that we need for signal generation
         self.tradable_assets = tradable_assets 
         self.data = data
+        self.prices = prices
 
         ## need to force that the data index is in the form of dates
         self.dates = data.index
@@ -161,8 +160,6 @@ class Backtester:
         self.slippage = slippage
         self.allow_short = allow_short
         self.execute_on_next_tick = execute_on_next_tick
-        self.periods_per_year = periods_per_year
-        self.riskfree = riskfree_per_period
 
         # history
         self.nav_history: pd.Series = pd.Series(np.zeros(len(self.data)), index=self.dates)
@@ -182,16 +179,90 @@ class Backtester:
         # For visualising results
         self.portfolio_returns = None
 
+    def run(self, verbose=False):
+        """
+        Runs the backtesting engine.
+        
+        Parameters
+        ----------
+        verbose : bool, optional
+        If True, returns output log each time a trade occurs, with the size of the trade and the amount traded for.
+            
+        Returns
+        -------
+        None
+        """
+        self.strategy_object.initialize()
+
+        T = len(self.data) 
+        previous_prices = None
+
+        pending_asset_amount = None
+
+        # Starting next tick execution 
+        for t in range(T):
+            date = self.dates[t]
+            self.current_date = date
+
+            current_prices = self.prices.loc[date].dropna()
+            self.tradable_assets = (current_prices.index).to_list()
+
+            # Mark-to-market PnL from existing constant-dollar notionals into cash.
+            self._mark_to_market_constant_notional(current_prices, previous_prices)
+
+            # NAV Calculation
+            self._calculate_nav(date)
+
+            # Perform next tick execution (if enabled) 
+            if self.execute_on_next_tick and pending_asset_amount is not None:
+                if verbose:
+                    print(f"{date.date()}: executing pending target\n{pending_asset_amount}")
+                    print(f"Current prices executed at: \n{current_prices}\n")
+                self._execute_target_portfolio(pending_asset_amount, current_prices, date)
+                pending_asset_amount = None
+
+            # Generate strategy signal using price history up to today
+            try:
+                trading_state = self._build_trading_state(date)
+                # Predict desired asset amount
+                pending_asset_amount = self.strategy_object.predict(
+                    self.tradable_assets,  # tradable assets
+                    self.data.loc[:date],  # data
+                    trading_state,  # trading state
+                )
+
+            except Exception as e:
+                pending_asset_amount = None
+                print(f"Error in strategy.predict at index {t} date {date}: {e} - Loop continuing")
+            
+            self.signal_history.append(pending_asset_amount)
+            
+            # Immediate execution
+            if not self.execute_on_next_tick:
+                if verbose:
+                    print(f"{date.date()}: executing pending target \n{pending_asset_amount}")
+                    print(f"\nCurrent prices executed at: \n{current_prices}")
+                self._execute_target_portfolio(pending_asset_amount, current_prices, date)
+                pending_asset_amount = None
+
+            # Record end-of-day NAV, shares and cash in one encapsulated call.
+            previous_prices = current_prices.copy()
+            
+        # Calculate backtest returns after backtest is complete.
+        self.portfolio_returns = self.nav_history.pct_change().dropna()
+        
+        # To call other plots later, must first be sure that the backtest is done.
+        self.backtest_complete=True 
+        return 
 
     # Debugging Functions 
     def _current_state(self):
         # Return a snapshot of current portfolio state (useful for debugging).
-        current_prices = self.data.loc[self.current_date, self.tradable_assets]
+        current_prices = self.prices.loc[self.current_date, self.tradable_assets]
         return {
             "cash": self.cash,
             # To dict method converts pandas Series to dictionary for easier view 
-            "shares": self.position,
-            "nav": self.cash + (self.position * current_prices).sum()
+            "nav": self.cash + (self.current_shares * current_prices).sum()
         }
 
     def _build_trading_state(self, date: pd.Timestamp) -> TradingState:
@@ -214,14 +285,14 @@ class Backtester:
     def _reset(self):
         # Reset only histories, not prices/strategy/config — useful if you want to re-run with same object.
         self.cash = float(self.cash_start)
-        self.position = pd.Series({asset:0 for asset in self.tradable_assets})
+        self.current_shares = pd.Series({asset:0 for asset in self.tradable_assets})
         self.current_date = self.dates[0]
         self.nav_history.clear()
         self.shares_history.clear()
         self.trades.clear()
         self.signal_history.clear()
 
-    def _calculate_end_of_day_nav(self, date: pd.Timestamp, current_prices: pd.Series) -> float:
+    def _calculate_nav(self, date: pd.Timestamp) -> float:
         # Encapsulated end-of-day bookkeeping for the portfolio state.
         # 1) Compute NAV from end-of-day cash and held dollar notionals.
         # 2) Persist NAV, shares and cash in their history objects at this date.
@@ -230,23 +301,36 @@ class Backtester:
         self.shares_history.loc[date, :] = self.current_shares
         self.cash_history.loc[date] = self.cash
         return self.current_nav
-
+        
     def _mark_to_market_constant_notional(self, current_prices: pd.Series, previous_prices: pd.Series):
-        # Revalue existing constant-dollar notionals by applying realized returns to cash.
-        # Position notionals remain in dollar terms; daily PnL is transferred to cash.
+        # First tick has no previous prices — nothing to mark.
         if previous_prices is None:
             return
 
-        safe_previous = previous_prices.replace(0, np.nan)
-        asset_returns = (current_prices / safe_previous - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        pnl_from_positions = (self.current_shares * asset_returns).sum()
+        # Only mark assets present in both snapshots AND currently held.
+        # Delisted assets (in current_shares but not in current_prices) are excluded
+        # here; their notional will be recycled to cash in _execute_target_portfolio.
+        active_assets = self.current_shares[self.current_shares != 0].index
+        common_assets = current_prices.index.intersection(previous_prices.index).intersection(active_assets)
+
+        if len(common_assets) == 0:
+            return
+
+        safe_previous = previous_prices[common_assets].replace(0, np.nan)
+        asset_returns = (
+            (current_prices[common_assets] / safe_previous - 1.0)
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+        pnl_from_positions = (self.current_shares[common_assets] * asset_returns).sum()
         self.cash += pnl_from_positions
 
-    def _calculate_delta_asset_value(self, target_asset_amt: pd.Series, target_cash_amt: float) -> pd.Series:
-        assert (target_cash_amt + target_asset_amt.sum()) - self.current_nav < 1e-6, "Target portfolio is not self-financing. Please ensure that the total dollar amount of the target portfolio equals current NAV for this backtesting engine to work."
+        return 
+
+    def _calculate_delta_asset_value(self, target_asset_amt: pd.Series) -> pd.Series:
         # Encapsulated delta between desired and current dollar exposure per asset.
         # Positive values indicate buy pressure, negative values indicate sell pressure.
-        return target_cash_amt - self.cash, target_asset_amt - self.current_shares
+        return target_asset_amt - self.current_shares
 
     def _calculate_commission(self, delta_asset_value: pd.Series) -> pd.Series:
         # Encapsulated commission model.
@@ -266,143 +350,81 @@ class Backtester:
     def _calculate_slippage(self, exec_price: pd.Series, delta_asset_value_after_commission: pd.Series) -> pd.Series:
         # Encapsulated slippage model.
         # Buys pay higher execution prices and sells receive lower execution prices.
+        assert(exec_price.index == delta_asset_value_after_commission.index).all(), "Execution price and asset value change must have the same index for slippage calculation."
         assert(exec_price > 0).all(), "Execution prices must be positive for slippage calculation."
+
+        
         shares_wanted = delta_asset_value_after_commission / exec_price
         slippage_prices = exec_price * (1.0 + self.slippage * np.sign(delta_asset_value_after_commission))
         
         slippage_cost = (slippage_prices - exec_price) * shares_wanted
+        assert(isinstance(slippage_cost, pd.Series)), "Slippage cost should be a pd.Series with the same index as exec_price."
         self.cash -= slippage_cost.sum()
         return slippage_prices, slippage_cost
 
 
-    def run(self, verbose=False):
-        """
-        Runs the backtesting engine.
-        
-        Parameters
-        ----------
-        verbose : bool, optional
-        If True, returns output log each time a trade occurs, with the size of the trade and the amount traded for.
-            
-        Returns
-        -------
-        None
-        """
-        self.strategy_object.initialize()
 
-        pending_target = None
-        T = len(self.data) 
-        previous_prices = None
+    def _execute_target_portfolio(self, target_asset_amt: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
+        # ------------------------------------------------------------------ #
+        # Step 1: Forced liquidation of delisted assets (NAV-preserving).    #
+        # Any asset currently held whose price is absent from exec_price is  #
+        # now untradable.  Its dollar notional is recycled to cash at book    #
+        # value so NAV (= cash + current_shares.sum()) is unchanged.         #
+        # ------------------------------------------------------------------ #
+        delisted_assets = self.current_shares.index.difference(exec_price.index)
+        if len(delisted_assets) > 0:
+            self.cash += self.current_shares[delisted_assets].sum()
+            self.current_shares = self.current_shares.drop(index=delisted_assets)
 
-        pending_cash_amount = None 
-        pending_asset_amount = None
+        # ------------------------------------------------------------------ #
+        # Step 2: Align current_shares to the live tradable universe.        #
+        # Assets that appear in exec_price for the first time start at 0.    #
+        # ------------------------------------------------------------------ #
+        self.current_shares = self.current_shares.reindex(exec_price.index, fill_value=0.0)
 
-        # Starting next tick execution 
-        for t in range(T):
-            date = self.dates[t]
-            self.current_date = date
-            current_prices = self.data.loc[date, self.tradable_assets]
-
-            # Mark-to-market PnL from existing constant-dollar notionals into cash.
-            self._mark_to_market_constant_notional(current_prices, previous_prices)
-
-            # NAV Calculation
-            self._calculate_end_of_day_nav(date, current_prices)
-
-            # Perform next tick execution (if enabled) 
-            if self.execute_on_next_tick and (pending_cash_amount is not None) and (pending_asset_amount is not None):
-                if verbose:
-                    print(f"{date.date()}: executing pending target\n{pending_asset_amount}")
-
-                    print(f"Current prices executed at: \n{current_prices}\n")
-                self._execute_target_portfolio(pending_cash_amount, pending_asset_amount, current_prices, date)
-                
-                pending_asset_amount = None
-                pending_cash_amount= None
-
-            # Generate strategy signal using price history up to today
-            try:
-                trading_state = self._build_trading_state(date)
-                # Predict desired asset amount
-                pending_cash_amount, pending_asset_amount = self.strategy_object.predict(
-                    self.tradable_assets,  # tradable assets
-                    self.data.loc[:date],  # data
-                    trading_state, # trading state
-                    )
-
-            except Exception as e:
-                pending_cash_amount, pending_asset_amount = None, None
-                print(f"Error in strategy.predict at index {t} date {date}: {e} - Loop continuing")
-            
-            self.signal_history.append(pending_asset_amount)
-            
-            # Immediate execution
-            if not self.execute_on_next_tick:
-                if verbose:
-                    print(f"{date.date()}: executing pending target \n{pending_asset_amount}")
-                    print(f"\nCurrent prices executed at: \n{current_prices}")
-                self._execute_target_portfolio(pending_cash_amount, pending_asset_amount, current_prices, date)
-                pending_asset_amount = None
-                pending_cash_amount = None
-
-            # Record end-of-day NAV, shares and cash in one encapsulated call.
-            previous_prices = current_prices.copy()
-            
-        # Calculate backtest returns after backtest is complete.
-        self.portfolio_returns = self.nav_history.pct_change().dropna()
-        
-        # To call other plots later, must first be sure that the backtest is done.
-        self.backtest_complete=True 
-        return 
-
-
-    def _execute_target_portfolio(self, target_cash_amt: float, target_asset_amt: pd.Series, exec_price: pd.Series, date: pd.Timestamp):
-
-        target_asset_amt = pd.Series(target_asset_amt, index=exec_price.index, dtype=float)
-        assert len(target_asset_amt) == len(exec_price), "For some reason your execution price is not the same as the tradable assets. Try checking the backtesting code."
-
-        note = "\n"
+        # ------------------------------------------------------------------ #
+        # Step 3: Align the strategy's target to the live tradable universe. #
+        # Targets for delisted assets are silently dropped; any asset with   #
+        # no explicit target defaults to 0 (close the position).             #
+        # ------------------------------------------------------------------ #
+        target_asset_amt = pd.Series(target_asset_amt, dtype=float).reindex(exec_price.index, fill_value=0.0)
 
         if not self.allow_short:
             target_asset_amt = target_asset_amt.clip(lower=0)
-            note += "Shorting not allowed, so negative asset amounts clipped to 0.\n"
 
         if self.current_nav <= 0:
-            note = "Net Asset Value is now 0. No trades can occur.\n"
-            return 
+            print(f"Net Asset Value is now 0 at {date}. No trades can occur.\n")
+            return
 
         # 1) Dollar changes needed per asset to reach target asset dollars
-        delta_asset_value, delta_cash_value = self._calculate_delta_asset_value(target_asset_amt, target_cash_amt)
-        
-        # if tiny change, skip (reduce noise): 
-        if abs(delta_asset_value.sum()) + abs(delta_cash_value) < 1e-8 * self.current_nav:
-            print("Trade not executed because position rebalance was too small.")
+        delta_asset_value = self._calculate_delta_asset_value(target_asset_amt)
+
+        # if tiny change, skip (reduce noise):
+        if abs(delta_asset_value.sum()) < 1e-8 * self.current_nav:
             return
 
         # 2) Compute commission per stock in dollar space.
         commission_dollars = self._calculate_commission(delta_asset_value)
 
-        # slippage: worse price depending on direction (buy => higher price, sell => lower price)
+        # 3) Slippage: worse price depending on direction
         trade_price, slippage_dollars = self._calculate_slippage(exec_price, delta_asset_value)
 
         # Under constant notional trading, we rebalance dollar notionals directly.
-        # 
         if not self._check_position_limits(target_asset_amt):
             delta_shares_wanted = pd.Series(0.0, index=target_asset_amt.index)
-            note += "Trade rejected by position limits.\n"
+            print(f"Trade rejected by position limits at {date}.")
         else:
             delta_shares_wanted = delta_asset_value
             self.current_shares += delta_shares_wanted
 
-
-        # record trade for auditing
+        # Record trade for auditing.
         self.trades.append(
             Trade(
                 date=date,
                 shares=dict(delta_shares_wanted),
                 price=dict(trade_price),
                 commission=commission_dollars + slippage_dollars,
-                note = note
+                note=""
             )
         )
 
@@ -412,23 +434,3 @@ class Backtester:
         if (target_asset_amt.abs() > 2e6).any():
             return False
         return True 
-
-
-from backtest.benchmarks import BuyAndHold
-
-data = pd.DataFrame({
-    "NVDA": [100, 110, 120, 130, 140],
-    "AAPL": [200, 190, 195, 205, 210]
-}, index=pd.date_range(start="2020-01-01", periods=5))
-tickers = data.columns
-
-buy_and_hold = BuyAndHold(1e6)
-backtester_buy_and_hold = Backtester(
-    data=data,
-    strategy_fn=buy_and_hold,
-    strategy_name="Buy and Hold",
-    tradable_assets=tickers,
-    cash_start=1000000,
-    slippage=0.05)
-
-# Test commission calculator

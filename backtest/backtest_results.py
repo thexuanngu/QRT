@@ -19,11 +19,12 @@ class VisualiseBacktestResults:
 
     """
     def __init__(self, 
-                 backtester,
-                 benchmark, 
-                 riskfree_rate=0.0):
+                 backtester: Backtester,
+                 benchmark: Backtester, 
+                 riskfree_rate: float = 0.0):
         
         assert backtester.backtest_complete, "This backtest has not been run."
+        assert benchmark.backtest_complete, "This benchmark backtest has not been run."
         
         self.backtester = backtester
         self.benchmark = benchmark
@@ -95,9 +96,7 @@ class VisualiseBacktestResults:
 
         # Calmar ratio 
         self._strategy_metrics["calmar"] = returns.mean() / abs(self._strategy_metrics["max_drawdown"])
-
         return 
-
 
     def performance_dashboard(self):    
 
@@ -144,15 +143,14 @@ class VisualiseBacktestResults:
         
         return 
 
-    def benchmark(self, benchmark_returns, riskfree=0.0):
-        
+    def calculate_alpha_versus_benchmark(self):
+
         # Basic error handling - exceptions should be thrown if not completed.
-        assert len(benchmark_returns) == len(self.backtester.portfolio_returns), "Benchmark returns length does not match portfolio returns length."
-        #assert benchmark is not None, "Benchmark needs to be loaded in before testing can properly be done."
+        assert len(self.benchmark.portfolio_returns) == len(self.backtester.portfolio_returns), "Benchmark returns length does not match portfolio returns length."
         
         # Straightforward - calculating the portfolio returns 
-        portfolio_excess = self.backtester.portfolio_returns - riskfree
-        market_excess = benchmark_returns - riskfree
+        portfolio_excess = self.backtester.portfolio_returns - self.riskfree_rate
+        market_excess = self.benchmark.portfolio_returns - self.riskfree_rate
 
         # Prepares the x variable (market risk-adjusted returns) for regression
         market_excess_regready = sm.add_constant(market_excess)
