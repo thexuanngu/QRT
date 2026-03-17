@@ -119,13 +119,14 @@ class FunctionStrategy(Strategy):
             return 0.0
 
         current_index = history.index[-1]
+        history_view = history.copy(deep=False)
 
         target_portfolio = None
         if self.mode == "event":
             try:
                 target_portfolio = self.user_fn(
                     tradable_assets,
-                    history.copy(),
+                    history_view,
                     trading_state,
                     self._state,
                 )
@@ -133,24 +134,24 @@ class FunctionStrategy(Strategy):
                 try:
                     target_portfolio = self.user_fn(
                         tradable_assets,
-                        history.copy(),
+                        history_view,
                         trading_state,
                     )
                 except TypeError:
                     target_portfolio = self.user_fn(
                         tradable_assets,
-                        history.copy(),
-                        trading_state.position_history.copy(),
+                        history_view,
+                        trading_state.position_history.copy(deep=False),
                     )
             except AttributeError:
                 target_portfolio = self.user_fn(
                     tradable_assets,
-                    history.copy(),
+                    history_view,
                     trading_state,
                 )
         else:
             if self._vector_cache is None or len(self._vector_cache) < len(history):
-                vector_out = self.user_fn(history.copy())
+                vector_out = self.user_fn(history_view)
                 if isinstance(vector_out, (pd.Series, pd.DataFrame)):
                     vec = pd.Series(vector_out.squeeze()).reindex(history.index)
                     self._vector_cache = vec.astype(float)

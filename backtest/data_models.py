@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import List, Optional
 
 import pandas as pd
 
@@ -9,10 +9,10 @@ class Trade:
     """Represents one executed rebalance transaction."""
 
     date: pd.Timestamp
-    shares: Dict[str, float]
-    price: Dict[str, float]
+    position: pd.Series
+    price: pd.Series
     commission: float
-    note: str = ""
+    slippage: float
 
 
 @dataclass
@@ -22,7 +22,7 @@ class TradingState:
     position_history: pd.DataFrame
     nav_history: pd.Series
     current_date: pd.Timestamp
-    current_shares: pd.Series
+    current_position: pd.Series
     current_nav: float
     trade_history: List[Trade]
-    signal_history: List[Any]
+    signal_history: List[Optional[pd.Series]]

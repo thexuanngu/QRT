@@ -164,3 +164,88 @@ class VisualiseBacktestResults:
         print(model.summary())
 
         return
+    
+    def ex_ante_risk_calculator(self, prices: pd.DataFrame, lookback: int = 60) -> pd.Series:
+        """
+        Compute ex-ante risk (annualised std dev of hypothetical daily P&L)
+        following the method in the screenshot:
+        - For each date t, form daily returns for the previous `lookback` days
+            and compute the P&L series that WOULD have occurred using today's
+            dollar positions (positions at t).
+        - For days where price is NaN for an asset (asset not tradable then),
+            that asset contributes 0 P&L for that day.
+        - Risk at t = std(daily_pnl_series) * sqrt(252)  (annualised volatility).
+        
+        Returns
+        -------
+        pd.Series
+            Annualised risk (same index as position_history).
+        """
+        # Basic checks / assertions
+        assert hasattr(self.backtester, "position_history"), "Backtester must have position_history."
+        if self.backtester.portfolio_returns is None:
+            raise AssertionError("Backtester.portfolio_returns is None — run backtest before calling this method.")
+        assert isinstance(self.backtester.portfolio_returns.index, pd.DatetimeIndex), (
+            "backtester.portfolio_returns must be indexed by pd.DatetimeIndex."
+        )
+
+        position_history = self.backtester.position_history
+        dates = position_history.index
+        N = len(position_history)
+
+        # Validate prices shape / index alignment assumptions
+        if not isinstance(prices.index, pd.DatetimeIndex):
+            raise AssertionError("`prices` must have a pd.DatetimeIndex.")
+
+        # Prepare output series
+        risk = pd.Series(index=dates, dtype=float)
+
+        # We'll iterate through each date (could be vectorized further,
+        # but loop is clear and safe with the alignment/edge handling).
+        for i, date in enumerate(dates):
+            # Build price window up to and including this date
+            start_idx = max(0, i - lookback)
+            # Using iloc to slice by row-position is safe if `prices` rows correspond to same ordering;
+            # fall back to date-based slicing if indexes match exactly.
+            try:
+                prices_for_period = prices.iloc[start_idx : i + 1].copy()
+            except Exception:
+                # Fallback to label-based slicing
+                prices_for_period = prices.loc[dates[start_idx] : date].copy()
+
+            # Need at least one return datapoint to compute std
+            if prices_for_period.shape[0] < 2:
+                risk.iloc[i] = np.nan
+                continue
+
+            # Compute daily returns (fractional). This yields NaN where price was missing.
+            returns = prices_for_period.pct_change().iloc[1:]  # drop the first NaN row from pct_change
+
+            # Today's position (dollar notionals). Align columns to ensure consistent ordering.
+            current_position: pd.Series = position_history.iloc[i].astype(float)
+            # Ensure returns have the same columns as current_position (assets absent historically -> cols missing)
+            returns_aligned = returns.reindex(columns=current_position.index)
+
+            # Where price was NaN historically, returns will be NaN -> those contributions should be zero.
+            returns_aligned = returns_aligned.fillna(0.0)
+
+            # Compute daily P&L series in dollars: for each day sum(return * today's position)
+            # returns_aligned is (days x assets), current_position is (assets,)
+            daily_pnl = (returns_aligned * current_position).sum(axis=1)
+
+            # If there's no variation in daily_pnl, set risk to 0 (no volatility)
+            std_profit = daily_pnl.std(ddof=0)  # population std is fine for a volatility estimate
+            if np.isnan(std_profit) or std_profit == 0.0:
+                risk.iloc[i] = 0.0
+                continue
+
+            # Annualise
+            annualised_vol = std_profit * np.sqrt(252.0)
+            risk.iloc[i] = annualised_vol
+
+        # keep the same index / name
+        risk.name = "ex_ante_annualised_pnl_vol"
+        return risk
+
+
+
